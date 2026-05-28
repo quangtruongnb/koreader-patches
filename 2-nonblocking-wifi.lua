@@ -129,6 +129,30 @@ local function sortNetworks(network_list)
     table.sort(network_list, function(l, r)
         return (l.signal_quality or 0) > (r.signal_quality or 0)
     end)
+    -- Deduplicate by SSID: wpa_supplicant returns one entry per BSSID,
+    -- so the same SSID can appear multiple times (mesh/repeater setups).
+    -- Since the list is already sorted by signal_quality descending, the
+    -- first occurrence of each SSID is the strongest.  We prefer any
+    -- "connected" entry regardless of signal strength.
+    local seen = {}
+    local i = 1
+    while i <= #network_list do
+        local nw = network_list[i]
+        local key = nw.ssid or ""
+        local prev = seen[key]
+        if prev then
+            if nw.connected and not prev.connected then
+                -- Promote this connected entry: copy its fields to prev
+                prev.connected = true
+                prev.wpa_supplicant_id = nw.wpa_supplicant_id
+                prev.bssid = nw.bssid
+            end
+            table.remove(network_list, i)
+        else
+            seen[key] = nw
+            i = i + 1
+        end
+    end
 end
 
 local function enableKoboWifi()
