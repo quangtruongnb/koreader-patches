@@ -162,7 +162,29 @@ local function enableKoboWifi()
 end
 
 local function obtainIPAndNotify(ssid, connect_callback)
-    NetworkMgr:obtainIP()
+    -- Try obtainIP with retries — DHCP may need multiple attempts when the
+    -- radio has just come up (e.g. after auto-connect on cold WiFi enable).
+    local max_retries = 3
+    local has_route = false
+    for attempt = 1, max_retries do
+        logger.dbg("Non-blocking Wi-Fi patch: obtainIP attempt", attempt, "of", max_retries)
+        NetworkMgr:obtainIP()
+        if NetworkMgr:hasDefaultRoute() then
+            has_route = true
+            break
+        end
+        logger.info("Non-blocking Wi-Fi patch: no default route after obtainIP attempt", attempt)
+        if attempt < max_retries then
+            -- Brief pause before retrying to let the network settle
+            ffiutil.sleep(1)
+        end
+    end
+
+    if not has_route then
+        logger.warn("Non-blocking Wi-Fi patch: connected to", util.fixUtf8(ssid, "?"), "but no default route available")
+        return false
+    end
+
     -- Broadcast NetworkConnected so plugins (KOSync, etc.) are notified
     NetworkMgr.wifi_was_on = true
     G_reader_settings:makeTrue("wifi_was_on")
@@ -175,6 +197,7 @@ local function obtainIPAndNotify(ssid, connect_callback)
         text = T(_("Connected to network %1"), BD.wrap(util.fixUtf8(ssid, "?"))),
         timeout = 3,
     })
+    return true
 end
 
 function WiFiQuickPopup:init()
@@ -418,12 +441,26 @@ end
 
 function WiFiQuickPopup:autoConnect(network_list)
     -- network_list is already sorted at scan completion; skip redundant sort.
+
+    -- wpa_supplicant may report a network as "connected" (L2 associated) even
+    -- when there is no IP or gateway.  Only trust it if we already have a route;
+    -- otherwise, tear down the stale association so a fresh auth cycle below
+    -- can establish a clean connection.
     for _, network in ipairs(network_list) do
         if network.connected then
-            local connect_callback = self.connect_callback
-            self.connect_callback = nil
-            obtainIPAndNotify(network.ssid, connect_callback)
-            return true
+            if NetworkMgr:hasDefaultRoute() then
+                -- Already fully online — just notify and fire the callback.
+                local connect_callback = self.connect_callback
+                self.connect_callback = nil
+                obtainIPAndNotify(network.ssid, connect_callback)
+                return true
+            end
+            -- Stale L2 association without IP — disconnect before re-auth.
+            logger.info("Non-blocking Wi-Fi patch: stale association on",
+                util.fixUtf8(network.ssid, "?"), "— disconnecting")
+            NetworkMgr:disconnectNetwork(network)
+            network.connected = false
+            break
         end
     end
 
@@ -432,15 +469,18 @@ function WiFiQuickPopup:autoConnect(network_list)
     for _, network in ipairs(network_list) do
         if network.password then
             attempted = true
-            logger.dbg("Non-blocking Wi-Fi patch: attempting preferred network", util.fixUtf8(network.ssid, "?"))
+            logger.dbg("Non-blocking Wi-Fi patch: attempting preferred network",
+                util.fixUtf8(network.ssid, "?"))
             local success
             success, err_msg = NetworkMgr:authenticateNetwork(network)
             if success then
                 network.connected = true
-                local connect_callback = self.connect_callback
-                self.connect_callback = nil
-                obtainIPAndNotify(network.ssid, connect_callback)
-                return true
+                if obtainIPAndNotify(network.ssid, self.connect_callback) then
+                    self.connect_callback = nil
+                    return true
+                end
+                -- Auth succeeded but DHCP still failed
+                return false, _("Connected but failed to obtain IP address"), true
             end
             logger.dbg("Non-blocking Wi-Fi patch: authentication failed:", err_msg)
         end
@@ -473,16 +513,7 @@ function WiFiQuickPopup:startScan(skip_autoconnect)
         sortNetworks(network_list)
         self.network_list = network_list
 
-        -- Skip auto-connect if already connected to a network
-        local already_connected = false
-        for _, network in ipairs(network_list) do
-            if network.connected then
-                already_connected = true
-                break
-            end
-        end
-
-        if not skip_autoconnect and not already_connected then
+        if not skip_autoconnect then
             local connected, err_msg, attempted = self:autoConnect(network_list)
             self.auto_connected = connected and true or false
             if attempted and not connected then
