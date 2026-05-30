@@ -212,7 +212,14 @@ function WiFiQuickPopup:init()
 
     self:rebuild()
 
-    if self.is_wifi_on and not cached_network_list and not bg_scan then
+    if not self.is_wifi_on then
+        -- Auto-enable WiFi when the popup opens from a turned-off state
+        UIManager:nextTick(function()
+            if self[1] then
+                self:toggleWifi()
+            end
+        end)
+    elseif not cached_network_list and not bg_scan then
         UIManager:nextTick(function()
             if self[1] then
                 self:startScan()
